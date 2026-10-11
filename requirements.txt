@@ -1,0 +1,4 @@
+notebooklm-py
+fastapi
+uvicorn[standard]
+httpx
