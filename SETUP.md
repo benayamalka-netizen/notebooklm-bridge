@@ -22,6 +22,8 @@ notebooklm auth check --test --json     # צריך להחזיר "status": "ok"
 | `BRIDGE_TOKEN` | מחרוזת אקראית ארוכה (למשל `openssl rand -hex 32`) |
 | `ALLOWED_MEDIA_ORIGIN` | מקורות מותרים לקובצי השמע, מופרדים בפסיקים, בלי סלאש בסוף. לאתר התמלולים ב-Vercel: `https://<project>.supabase.co/storage/v1/object/sign/uploads` |
 | `NOTEBOOKLM_AUTH_JSON` | תוכן storage_state.json |
+| `FOLDER_PREFIX` | (לא חובה) שם המחברות, ברירת מחדל `שיעורים` ← "שיעורים 001", "שיעורים 002"… |
+| `SOURCE_LIMIT` | (לא חובה) כמה מקורות במחברת לפני שנפתחת חדשה, ברירת מחדל 50 (בחשבון Pro אפשר 300) |
 
 ## 3. העלאה
 
