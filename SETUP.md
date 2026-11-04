@@ -20,7 +20,7 @@ notebooklm auth check --test --json     # צריך להחזיר "status": "ok"
 | משתנה | ערך |
 |---|---|
 | `BRIDGE_TOKEN` | מחרוזת אקראית ארוכה (למשל `openssl rand -hex 32`) |
-| `ALLOWED_MEDIA_ORIGIN` | הכתובת המפורסמת של האפליקציה, בלי סלאש בסוף |
+| `ALLOWED_MEDIA_ORIGIN` | מקורות מותרים לקובצי השמע, מופרדים בפסיקים, בלי סלאש בסוף. לאתר התמלולים ב-Vercel: `https://<project>.supabase.co/storage/v1/object/sign/uploads` |
 | `NOTEBOOKLM_AUTH_JSON` | תוכן storage_state.json |
 
 ## 3. העלאה
@@ -36,3 +36,13 @@ notebooklm auth check --test --json     # צריך להחזיר "status": "ok"
 - `NOTEBOOKLM_BRIDGE_TOKEN` = אותו ערך של `BRIDGE_TOKEN`
 
 ואז באפליקציה המפורסמת: בפאנל התמלול של שיעור, "מנוע תמלול" ← NotebookLM.
+
+## 5. חיבור לאתר התמלולים (shiur-transcripts ב-Vercel)
+
+ב-Vercel ← Project Settings ← Environment Variables:
+
+- `NOTEBOOKLM_BRIDGE_URL` = כתובת הגשר
+- `NOTEBOOKLM_BRIDGE_TOKEN` = אותו ערך של `BRIDGE_TOKEN`
+
+ובגשר יש להוסיף ל-`ALLOWED_MEDIA_ORIGIN` את כתובת האחסון של Supabase (ראו טבלה למעלה).
+אחרי פריסה מחדש, בהעלאת קובץ שמע מופיעה בחירת מנוע: NotebookLM.

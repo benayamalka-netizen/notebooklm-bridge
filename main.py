@@ -6,7 +6,8 @@
 
 משתני סביבה:
   BRIDGE_TOKEN           סוד משותף עם האפליקציה (כותרת Authorization: Bearer ...)
-  ALLOWED_MEDIA_ORIGIN   המקור של האפליקציה, למשל https://my-app.lovable.app (מונע SSRF)
+  ALLOWED_MEDIA_ORIGIN   מקורות מותרים לקובצי השמע, מופרדים בפסיקים (מונע SSRF), למשל
+                         https://my-app.lovable.app,https://xxxx.supabase.co/storage/v1/object/sign/uploads
   NOTEBOOKLM_AUTH_JSON   תוכן storage_state.json של חשבון גוגל ייעודי (או קובץ ב-NOTEBOOKLM_HOME)
   MAX_CONCURRENT_JOBS    ברירת מחדל 2
   SOURCE_WAIT_SECONDS    כמה זמן לחכות לעיבוד המקור, ברירת מחדל 1800
@@ -30,7 +31,7 @@ from notebooklm import NotebookLMClient
 from pydantic import BaseModel
 
 TOKEN = os.environ["BRIDGE_TOKEN"]
-ALLOWED_ORIGIN = os.environ["ALLOWED_MEDIA_ORIGIN"].rstrip("/")
+ALLOWED_PREFIXES = [o.strip().rstrip("/") + "/" for o in os.environ["ALLOWED_MEDIA_ORIGIN"].split(",") if o.strip()]
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 SOURCE_WAIT_SECONDS = float(os.getenv("SOURCE_WAIT_SECONDS", "1800"))
 JOB_TTL_SECONDS = 6 * 3600
@@ -112,7 +113,7 @@ async def _run_job(client: NotebookLMClient, job_id: str, media_url: str, title:
 
 @app.post("/transcribe", dependencies=[Depends(require_token)])
 async def start(req: TranscribeRequest):
-    if not req.mediaUrl.startswith(ALLOWED_ORIGIN + "/"):
+    if not any(req.mediaUrl.startswith(p) for p in ALLOWED_PREFIXES):
         raise HTTPException(status_code=400, detail="mediaUrl is not under the allowed origin")
     _purge_old_jobs()
     job_id = uuid.uuid4().hex
