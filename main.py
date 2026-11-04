@@ -16,7 +16,9 @@
 משתני סביבה:
   BRIDGE_TOKEN           סוד משותף עם האתרים
   ALLOWED_MEDIA_ORIGIN   מקורות מותרים לקובצי שמע, מופרדים בפסיקים (מונע SSRF)
-  NOTEBOOKLM_AUTH_JSON   תוכן storage_state.json של חשבון גוגל ייעודי
+  NOTEBOOKLM_MASTER_TOKEN_JSON  (מומלץ) תוכן master_token.json מ-"notebooklm login --master-token":
+                         התחברות עמידה — הספרייה מנפיקה ממנה עוגיות חדשות כשהישנות פגות
+  NOTEBOOKLM_AUTH_JSON   תוכן storage_state.json (עוגיות בלבד; פג תוך זמן קצר, רק לגיבוי)
   FOLDER_PREFIX          שם המחברות, ברירת מחדל "שיעורים"
   SOURCE_LIMIT           כמה מקורות במחברת לפני שנפתחת חדשה, ברירת מחדל 50 (בחשבון Pro: 300)
   MAX_CONCURRENT_JOBS    ברירת מחדל 2
@@ -45,6 +47,8 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from notebooklm import NotebookLMClient
+from notebooklm import auth as nlm_auth
+from notebooklm import paths as nlm_paths
 from notebooklm import types as T
 from pydantic import BaseModel
 
@@ -64,12 +68,35 @@ SEM = asyncio.Semaphore(MAX_CONCURRENT)
 FOLDER_LOCK = asyncio.Lock()
 
 
+async def _prepare_master_token() -> str:
+    """Durable login: write the master token beside the profile's storage_state.json and mint
+    fresh cookies from it. Inline NOTEBOOKLM_AUTH_JSON would bypass the library's re-mint path,
+    so it's dropped when a master token is present."""
+    secret = os.environ.pop("NOTEBOOKLM_MASTER_TOKEN_JSON", "").strip()
+    if not secret:
+        return "cookies" if os.getenv("NOTEBOOKLM_AUTH_JSON") else "none"
+    os.environ.pop("NOTEBOOKLM_AUTH_JSON", None)
+    token_path = nlm_paths.get_master_token_path()
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(secret, encoding="utf-8")
+    os.chmod(token_path, 0o600)
+    del secret
+    await nlm_auth.bootstrap_missing_storage_from_master_token(nlm_paths.get_storage_path())
+    return "master_token"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # לקוח אחד לכל worker, לפי התיעוד של הספרייה.
     # בלי התחברות לגוגל השרת עדיין עולה: /health מדווח auth=false והפעולות מחזירות 503.
     app.state.client = None
     app.state.auth_error = ""
+    app.state.auth_mode = "none"
+    try:
+        app.state.auth_mode = await _prepare_master_token()
+    except Exception as exc:  # noqa: BLE001
+        app.state.auth_mode = "master_token"
+        app.state.auth_error = f"master token: {type(exc).__name__}: {exc}"[:300]
     try:
         async with NotebookLMClient.from_storage(keepalive=600) as client:
             app.state.client = client
@@ -78,7 +105,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         if app.state.client is not None:
             raise
-        app.state.auth_error = f"{type(exc).__name__}: {exc}"[:300]
+        app.state.auth_error = (app.state.auth_error + " | " if app.state.auth_error else "") + f"{type(exc).__name__}: {exc}"[:300]
     yield
 
 
@@ -395,4 +422,6 @@ async def download(job_id: str, exp: int, sig: str):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "auth": app.state.client is not None}
+    # the reason a login failed (exception text only, never credentials) helps fix it from afar
+    return {"ok": True, "auth": app.state.client is not None, "mode": app.state.auth_mode,
+            **({"error": app.state.auth_error} if app.state.client is None and app.state.auth_error else {})}

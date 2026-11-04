@@ -2,6 +2,19 @@
 
 ## 1. התחברות לגוגל (פעם אחת, במחשב שלך)
 
+**מומלץ — התחברות עמידה (master token):** קובץ עוגיות מועתק פג תוך זמן קצר, כי גוגל מחליפה את העוגיות.
+master token נשאר בתוקף, והספרייה מנפיקה ממנו עוגיות חדשות בעצמה.
+
+```
+uv tool install --force "notebooklm-py[browser,headless]"
+notebooklm login --master-token --account <האימייל>
+```
+
+התוכן של `~/.notebooklm/profiles/default/master_token.json` הוא הערך של `NOTEBOOKLM_MASTER_TOKEN_JSON` בשרת.
+זה אישור גישה מלא לחשבון — עדיף חשבון ייעודי, ולא לשתף אותו.
+
+**חלופה (קצרת טווח):**
+
 מומלץ חשבון גוגל ייעודי לתמלול, לא החשבון האישי.
 
 ```
@@ -21,7 +34,8 @@ notebooklm auth check --test --json     # צריך להחזיר "status": "ok"
 |---|---|
 | `BRIDGE_TOKEN` | מחרוזת אקראית ארוכה (למשל `openssl rand -hex 32`) |
 | `ALLOWED_MEDIA_ORIGIN` | מקורות מותרים לקובצי השמע, מופרדים בפסיקים, בלי סלאש בסוף. לאתר התמלולים ב-Vercel: `https://<project>.supabase.co/storage/v1/object/sign/uploads` |
-| `NOTEBOOKLM_AUTH_JSON` | תוכן storage_state.json |
+| `NOTEBOOKLM_MASTER_TOKEN_JSON` | (מומלץ) תוכן master_token.json |
+| `NOTEBOOKLM_AUTH_JSON` | (גיבוי) תוכן storage_state.json |
 | `FOLDER_PREFIX` | (לא חובה) שם המחברות, ברירת מחדל `שיעורים` ← "שיעורים 001", "שיעורים 002"… |
 | `SOURCE_LIMIT` | (לא חובה) כמה מקורות במחברת לפני שנפתחת חדשה, ברירת מחדל 50 (בחשבון Pro אפשר 300) |
 
