@@ -42,10 +42,20 @@ SEM = asyncio.Semaphore(MAX_CONCURRENT)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # לקוח אחד לכל worker, לפי התיעוד של הספרייה
-    async with NotebookLMClient.from_storage(keepalive=600) as client:
-        app.state.client = client
-        yield
+    # לקוח אחד לכל worker, לפי התיעוד של הספרייה.
+    # בלי התחברות לגוגל השרת עדיין עולה: /health מדווח auth=false והתמלול מחזיר 503.
+    app.state.client = None
+    app.state.auth_error = ""
+    try:
+        async with NotebookLMClient.from_storage(keepalive=600) as client:
+            app.state.client = client
+            yield
+            return
+    except Exception as exc:  # noqa: BLE001
+        if app.state.client is not None:
+            raise
+        app.state.auth_error = f"{type(exc).__name__}: {exc}"[:300]
+    yield
 
 
 app = FastAPI(lifespan=lifespan)
@@ -115,6 +125,8 @@ async def _run_job(client: NotebookLMClient, job_id: str, media_url: str, title:
 async def start(req: TranscribeRequest):
     if not any(req.mediaUrl.startswith(p) for p in ALLOWED_PREFIXES):
         raise HTTPException(status_code=400, detail="mediaUrl is not under the allowed origin")
+    if app.state.client is None:
+        raise HTTPException(status_code=503, detail="NotebookLM is not logged in on the bridge")
     _purge_old_jobs()
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"status": "pending", "created": time.time()}
@@ -132,4 +144,4 @@ async def status(job_id: str):
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "auth": app.state.client is not None}
