@@ -425,6 +425,31 @@ def _enum(enum_cls, value):
         raise HTTPException(status_code=400, detail=f"bad option {value!r} for {enum_cls.__name__}")
 
 
+async def download_artifact(c: NotebookLMClient, nb: str, k: str, artifact_id: str, out: Path) -> None:
+    """מוריד תוצר סטודיו קיים מ-NotebookLM לקובץ (לפי סוג ומזהה)."""
+    a = c.artifacts
+    if k == "audio":
+        await a.download_audio(nb, str(out), artifact_id)
+    elif k == "video":
+        await a.download_video(nb, str(out), artifact_id)
+    elif k == "slide_deck":
+        await a.download_slide_deck(nb, str(out), artifact_id, output_format="pdf")
+    elif k == "slide_deck_pptx":
+        await a.download_slide_deck(nb, str(out), artifact_id, output_format="pptx")
+    elif k == "infographic":
+        await a.download_infographic(nb, str(out), artifact_id)
+    elif k in ("report", "study_guide"):
+        await a.download_report(nb, str(out), artifact_id)
+    elif k == "quiz":
+        await a.download_quiz(nb, str(out), artifact_id, output_format="json")
+    elif k == "flashcards":
+        await a.download_flashcards(nb, str(out), artifact_id, output_format="json")
+    elif k == "data_table":
+        await a.download_data_table(nb, str(out), artifact_id)
+    else:
+        raise HTTPException(status_code=400, detail=f"cannot download kind {k}")
+
+
 @app.post("/studio", dependencies=[Depends(require_token)])
 async def studio(req: StudioRequest):
     if req.kind not in STUDIO_KINDS:
@@ -482,26 +507,11 @@ async def studio(req: StudioRequest):
             if not st.is_complete:
                 raise RuntimeError(st.error or f"התוצר לא הושלם ({st.status})")
             artifact_id = st.task_id
-            if k == "audio":
-                await a.download_audio(nb, str(out), artifact_id)
-            elif k == "video":
-                await a.download_video(nb, str(out), artifact_id)
-            elif k == "slide_deck":
-                await a.download_slide_deck(nb, str(out), artifact_id, output_format="pdf")
-            elif k == "slide_deck_pptx":
-                await a.download_slide_deck(nb, str(out), artifact_id, output_format="pptx")
-            elif k == "infographic":
-                await a.download_infographic(nb, str(out), artifact_id)
-            elif k in ("report", "study_guide"):
-                await a.download_report(nb, str(out), artifact_id)
-            elif k == "quiz":
-                await a.download_quiz(nb, str(out), artifact_id, output_format="json")
-            elif k == "flashcards":
-                await a.download_flashcards(nb, str(out), artifact_id, output_format="json")
-            elif k == "data_table":
-                await a.download_data_table(nb, str(out), artifact_id)
+            await download_artifact(c, nb, k, artifact_id, out)
         JOBS[job_id]["file"] = str(out)
-        result: dict[str, Any] = {"mime": mime, "fileName": f"{k}{ext}", "size": out.stat().st_size}
+        result: dict[str, Any] = {"mime": mime, "fileName": f"{k}{ext}", "size": out.stat().st_size, "notebookId": nb}
+        if k != "mind_map":
+            result["artifactId"] = artifact_id
         # תוצרים טקסטואליים קטנים חוזרים גם כטקסט, כדי שהאתר יציג אותם בלי הורדה
         if ext in (".md", ".json", ".csv") and out.stat().st_size < 400_000:
             result["content"] = out.read_text(encoding="utf-8", errors="replace")
@@ -533,6 +543,38 @@ async def download(job_id: str, exp: int, sig: str):
     if not job or not job.get("file") or not Path(job["file"]).exists():
         raise HTTPException(status_code=404, detail="file is gone; create it again")
     return FileResponse(job["file"], media_type=job.get("mime"), filename=job.get("fileName"))
+
+
+ARTIFACT_CACHE = Path(tempfile.gettempdir()) / "nlm-artifacts"
+ARTIFACT_CACHE.mkdir(parents=True, exist_ok=True)
+
+
+def artifact_signature(nb: str, kind: str, aid: str, exp: int) -> str:
+    return hmac.new(TOKEN.encode(), f"{nb}:{kind}:{aid}:{exp}".encode(), hashlib.sha256).hexdigest()
+
+
+@app.get("/artifacts/{notebook_id}/{kind}/{artifact_id}")
+async def artifact_file(notebook_id: str, kind: str, artifact_id: str, exp: int, sig: str):
+    """קישור חתום וקבוע לתוצר: מוריד אותו מ-NotebookLM כשצריך, כך שהוא לא הולך לאיבוד כשהשרת מתאתחל."""
+    if exp < time.time() or not secrets.compare_digest(sig, artifact_signature(notebook_id, kind, artifact_id, exp)):
+        raise HTTPException(status_code=403, detail="link expired or invalid")
+    if kind not in STUDIO_KINDS or kind == "mind_map":
+        raise HTTPException(status_code=400, detail="unknown kind")
+    ext, mime = STUDIO_KINDS[kind]
+    out = ARTIFACT_CACHE / f"{hashlib.sha256(f'{notebook_id}:{kind}:{artifact_id}'.encode()).hexdigest()}{ext}"
+    if not out.exists() or out.stat().st_size == 0:
+        await download_artifact(client(), notebook_id, kind, artifact_id, out)
+    return FileResponse(out, media_type=mime, filename=f"{kind}{ext}")
+
+
+@app.get("/notebooks/{notebook_id}/artifacts", dependencies=[Depends(require_token)])
+async def notebook_artifacts(notebook_id: str):
+    """התוצרים במחברת (החדשים קודם): לאתר שחוזר אחרי שיצא באמצע יצירה."""
+    items = await client().artifacts.list(notebook_id)
+    items.sort(key=lambda x: x.created_at.timestamp() if x.created_at else 0, reverse=True)
+    return {"artifacts": [{"id": x.id, "kind": str(getattr(x.kind, "value", x.kind)), "title": x.title,
+                           "complete": bool(getattr(x, "is_completed", False)), "failed": bool(getattr(x, "is_failed", False)),
+                           "created": _iso(x.created_at)} for x in items]}
 
 
 @app.get("/health")
