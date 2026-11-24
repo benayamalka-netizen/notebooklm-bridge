@@ -28,6 +28,13 @@
   MAX_CONCURRENT_JOBS    ברירת מחדל 2
   SOURCE_WAIT_SECONDS    כמה זמן לחכות לעיבוד מקור, ברירת מחדל 1800
   STUDIO_WAIT_SECONDS    כמה זמן לחכות לתוצר סטודיו, ברירת מחדל 2700
+  NOTEBOOK_LIMIT         כמה מחברות מותר בחשבון, ברירת מחדל 100 (בחשבון Pro: 500)
+  CLEANUP_BATCH          כמה מחברות ישנות למחוק כשאין מקום, ברירת מחדל 5
+  CLEANUP_HOURS          כל כמה שעות לבדוק אם צריך לפנות מקום, ברירת מחדל 6
+
+מחברות ציבוריות: כל מחברת "שיעורים NNN" משותפת לכל משתמשי האתרים. כשהיא נפתחת נכתב בה פתק
+"📢 מחברת ציבורית". כשמספר המחברות בחשבון מגיע למגבלה, נמחקות CLEANUP_BATCH המחברות הישנות ביותר
+מסוג "שיעורים NNN" בלבד (מחברות אחרות בחשבון לא נוגעים בהן), גם בבדיקה התקופתית וגם כשיצירה נכשלת.
 
 חשוב להריץ worker אחד בלבד (המשימות והקבצים נשמרים בזיכרון ובדיסק המקומי).
 """
@@ -63,6 +70,13 @@ SOURCE_LIMIT = int(os.getenv("SOURCE_LIMIT", "50"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 SOURCE_WAIT_SECONDS = float(os.getenv("SOURCE_WAIT_SECONDS", "1800"))
 STUDIO_WAIT_SECONDS = float(os.getenv("STUDIO_WAIT_SECONDS", "2700"))
+NOTEBOOK_LIMIT = int(os.getenv("NOTEBOOK_LIMIT", "100"))
+CLEANUP_BATCH = int(os.getenv("CLEANUP_BATCH", "5"))
+CLEANUP_HOURS = float(os.getenv("CLEANUP_HOURS", "6"))
+PUBLIC_NOTE_TITLE = "📢 מחברת ציבורית"
+PUBLIC_NOTE = ("מחברת ציבורית: כל משתמשי אתרי השיעורים מעלים אליה שיעורים, ואין לשמור בה תוכן פרטי.\n"
+               "כשהמקום בחשבון מתמלא, המחברות הציבוריות הישנות ביותר נמחקות אוטומטית "
+               f"({CLEANUP_BATCH} בכל פעם).")
 JOB_TTL_SECONDS = 6 * 3600
 FILES_DIR = Path(tempfile.gettempdir()) / "nlm-files"
 FILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,7 +118,11 @@ async def lifespan(app: FastAPI):
     try:
         async with NotebookLMClient.from_storage(keepalive=600) as client:
             app.state.client = client
-            yield
+            cleaner = asyncio.create_task(_cleanup_loop(client))
+            try:
+                yield
+            finally:
+                cleaner.cancel()
             return
     except Exception as exc:  # noqa: BLE001
         if app.state.client is not None:
@@ -167,10 +185,58 @@ def _folder_number(title: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+async def make_room(c: NotebookLMClient, items=None, force: bool = False) -> list[str]:
+    """כשהחשבון מגיע למגבלת המחברות: מוחקים את CLEANUP_BATCH המחברות הציבוריות הישנות ביותר.
+    רק "שיעורים NNN", ולעולם לא האחרונה שבהן (אליה נכנסים עכשיו מקורות). נקרא בתוך FOLDER_LOCK."""
+    items = items if items is not None else await c.notebooks.list()
+    if not force and len(items) < NOTEBOOK_LIMIT - 1:
+        return []
+    numbered = sorted(((n, nb) for nb in items if (n := _folder_number(nb.title)) is not None), key=lambda x: x[0])
+    victims = [nb for _, nb in numbered[:-1]][:CLEANUP_BATCH]
+    deleted = []
+    for nb in victims:
+        try:
+            await c.notebooks.delete(nb.id)
+            deleted.append(nb.id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"cleanup: could not delete {nb.title}: {exc}", flush=True)
+    if deleted:
+        print(f"cleanup: deleted {len(deleted)} old public notebooks", flush=True)
+    return deleted
+
+
+async def _cleanup_loop(c: NotebookLMClient) -> None:
+    while True:
+        try:
+            async with FOLDER_LOCK:
+                await make_room(c)
+        except Exception as exc:  # noqa: BLE001
+            print(f"cleanup check failed: {exc}", flush=True)
+        await asyncio.sleep(CLEANUP_HOURS * 3600)
+
+
+async def open_public_notebook(c: NotebookLMClient, title: str, items) -> str:
+    """פותח מחברת חדשה (מפנה מקום קודם אם צריך) וכותב בה שהיא ציבורית. נקרא בתוך FOLDER_LOCK."""
+    await make_room(c, items)
+    try:
+        created = await c.notebooks.create(title)
+    except Exception as exc:
+        # המגבלה האמיתית נמוכה מ-NOTEBOOK_LIMIT: מפנים מקום ומנסים שוב פעם אחת (רק בשגיאת מכסה)
+        if not re.search(r"exhaust|quota|limit|RESOURCE", str(exc), re.I) or not await make_room(c, force=True):
+            raise
+        created = await c.notebooks.create(title)
+    try:
+        await c.notes.create(created.id, PUBLIC_NOTE_TITLE, PUBLIC_NOTE)
+    except Exception as exc:  # noqa: BLE001 - הפתק לא חיוני להעלאה עצמה
+        print(f"public note failed for {title}: {exc}", flush=True)
+    return created.id
+
+
 async def current_notebook(c: NotebookLMClient) -> str:
     """המחברת האחרונה לפי המספר; אם מלאה, פותחים את הבאה בתור."""
     async with FOLDER_LOCK:
-        numbered = [(n, nb) for nb in await c.notebooks.list() if (n := _folder_number(nb.title)) is not None]
+        items = await c.notebooks.list()
+        numbered = [(n, nb) for nb in items if (n := _folder_number(nb.title)) is not None]
         if numbered:
             num, nb = max(numbered, key=lambda x: x[0])
             count = nb.sources_count
@@ -181,8 +247,7 @@ async def current_notebook(c: NotebookLMClient) -> str:
             num += 1
         else:
             num = 1
-        created = await c.notebooks.create(f"{FOLDER_PREFIX} {num:03d}")
-        return created.id
+        return await open_public_notebook(c, f"{FOLDER_PREFIX} {num:03d}", items)
 
 
 async def target_notebook(c: NotebookLMClient, notebook_id: str | None, notebook_title: str | None) -> str:
