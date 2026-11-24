@@ -5,8 +5,12 @@
 כשהיא מלאה (SOURCE_LIMIT מקורות) נפתחת מחברת חדשה עם המספר הבא.
 
 נקודות קצה (כולן עם Authorization: Bearer BRIDGE_TOKEN, חוץ מ-/health ומ-/files):
-  POST /transcribe   {mediaUrl, title}              ← משימה: קובץ שמע ← מקור ← טקסט מלא
-  POST /sources      {url | text, title}            ← משימה: קישור מכל סוג / טקסט ← מקור ← טקסט מלא
+  POST /transcribe   {mediaUrl, title, notebookId?, notebookTitle?}   ← משימה: קובץ (שמע / מסמך) ← מקור ← טקסט מלא
+  POST /sources      {url | text, title, notebookId?, notebookTitle?}  ← משימה: קישור מכל סוג / טקסט ← מקור ← טקסט מלא
+  GET  /notebooks                                    ← המחברות (החדשות קודם)
+  GET  /notebooks/{id}/sources                       ← המקורות במחברת (החדשים קודם)
+  GET  /notebooks/{id}/sources/{sourceId}/text       ← הטקסט המלא של מקור (למשל תמלול שיעור)
+  (בלי notebookId/notebookTitle המקור נכנס למחברת האוטומטית "שיעורים NNN"; notebookTitle שלא קיים – נוצר)
   POST /chat         {notebookId, question, sourceIds?, conversationId?}  ← תשובה מיידית
   POST /studio       {notebookId, kind, sourceIds?, instructions?, language?, options?}  ← משימה: תוצר סטודיו לקובץ
   GET  /jobs/{id}                                    ← מצב משימה (גם /transcribe/{id} לתאימות)
@@ -181,6 +185,24 @@ async def current_notebook(c: NotebookLMClient) -> str:
         return created.id
 
 
+async def target_notebook(c: NotebookLMClient, notebook_id: str | None, notebook_title: str | None) -> str:
+    """מחברת שנבחרה (לפי מזהה, או לפי שם – ואם אין כזו, נוצרת), אחרת המחברת האוטומטית."""
+    if notebook_id:
+        return notebook_id
+    if notebook_title and notebook_title.strip():
+        name = notebook_title.strip()
+        async with FOLDER_LOCK:
+            for nb in await c.notebooks.list():
+                if (nb.title or "").strip() == name:
+                    return nb.id
+            return (await c.notebooks.create(name)).id
+    return await current_notebook(c)
+
+
+def _iso(d) -> str | None:
+    return d.isoformat() if d else None
+
+
 async def _fulltext(c: NotebookLMClient, notebook_id: str, source_id: str) -> dict:
     ft = await c.sources.get_fulltext(notebook_id, source_id)
     text = (ft.content or "").strip()
@@ -194,6 +216,8 @@ async def _fulltext(c: NotebookLMClient, notebook_id: str, source_id: str) -> di
 class TranscribeRequest(BaseModel):
     mediaUrl: str
     title: str = "lesson"
+    notebookId: str | None = None
+    notebookTitle: str | None = None
 
 
 @app.post("/transcribe", dependencies=[Depends(require_token)])
@@ -215,7 +239,7 @@ async def transcribe(req: TranscribeRequest):
                         async for chunk in resp.aiter_bytes(1 << 20):
                             fh.write(chunk)
             mime = content_type if content_type.startswith(("audio/", "video/")) else None
-            notebook_id = await current_notebook(c)
+            notebook_id = await target_notebook(c, req.notebookId, req.notebookTitle)
             source = await c.sources.add_file(notebook_id, path, mime, wait=True, wait_timeout=SOURCE_WAIT_SECONDS, title=req.title)
             return await _fulltext(c, notebook_id, source.id)
         finally:
@@ -230,6 +254,8 @@ class SourceRequest(BaseModel):
     url: str | None = None
     text: str | None = None
     title: str | None = None
+    notebookId: str | None = None
+    notebookTitle: str | None = None
 
 
 DRIVE_RE = re.compile(r"https://(?:docs|drive)\.google\.com/.*?(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})")
@@ -244,7 +270,7 @@ async def add_source(req: SourceRequest):
     c = client()
 
     async def run(job_id: str) -> dict:
-        notebook_id = await current_notebook(c)
+        notebook_id = await target_notebook(c, req.notebookId, req.notebookTitle)
         if req.text:
             source = await c.sources.add_text(notebook_id, (req.title or "טקסט")[:200], req.text, wait=True, wait_timeout=SOURCE_WAIT_SECONDS)
         elif (m := DRIVE_RE.match(req.url or "")):
@@ -256,6 +282,29 @@ async def add_source(req: SourceRequest):
         return await _fulltext(c, notebook_id, source.id)
 
     return {"jobId": _new_job("source", run)}
+
+
+# ---------- עיון במחברות ----------
+
+@app.get("/notebooks", dependencies=[Depends(require_token)])
+async def notebooks():
+    c = client()
+    items = await c.notebooks.list()
+    items.sort(key=lambda n: n.created_at.timestamp() if n.created_at else 0, reverse=True)
+    return {"notebooks": [{"id": n.id, "title": n.title, "sources": n.sources_count, "created": _iso(n.created_at)} for n in items]}
+
+
+@app.get("/notebooks/{notebook_id}/sources", dependencies=[Depends(require_token)])
+async def notebook_sources(notebook_id: str):
+    c = client()
+    items = await c.sources.list(notebook_id)
+    items.sort(key=lambda s: s.created_at.timestamp() if s.created_at else 0, reverse=True)
+    return {"sources": [{"id": s.id, "title": s.title, "created": _iso(s.created_at), "url": s.url} for s in items]}
+
+
+@app.get("/notebooks/{notebook_id}/sources/{source_id}/text", dependencies=[Depends(require_token)])
+async def source_text(notebook_id: str, source_id: str):
+    return await _fulltext(client(), notebook_id, source_id)
 
 
 # ---------- צ'אט ----------
