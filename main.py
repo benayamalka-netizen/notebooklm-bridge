@@ -169,6 +169,7 @@ def _new_job(kind: str, coro_factory) -> str:
             JOBS[job_id].update(status="completed", **result)
         except Exception as exc:  # noqa: BLE001 - מחזירים לאתר הודעה קריאה
             JOBS[job_id].update(status="failed", error=f"{type(exc).__name__}: {exc}"[:500])
+            print(f"job {kind} {job_id} failed: {type(exc).__name__}: {exc}"[:800], flush=True)
 
     asyncio.create_task(runner())
     return job_id
