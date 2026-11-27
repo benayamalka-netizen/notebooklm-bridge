@@ -277,6 +277,23 @@ async def _fulltext(c: NotebookLMClient, notebook_id: str, source_id: str) -> di
     return {"text": text, "title": ft.title or "", "notebookId": notebook_id, "sourceId": source_id}
 
 
+SOURCE_ID_RE = re.compile(r"Source ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+
+
+async def _dropping_failed(c: NotebookLMClient, notebook_id: str, adding):
+    """מוסיף מקור; אם העיבוד שלו נכשל, מוחק את המקור השבור כדי שלא יתפוס מקום במחברת."""
+    try:
+        return await adding
+    except Exception as exc:  # noqa: BLE001
+        if (m := SOURCE_ID_RE.search(str(exc))):
+            try:
+                await c.sources.delete(notebook_id, m.group(1))
+                print(f"dropped failed source {m.group(1)}", flush=True)
+            except Exception as del_exc:  # noqa: BLE001
+                print(f"could not drop failed source {m.group(1)}: {del_exc}", flush=True)
+        raise
+
+
 # ---------- תמלול קובץ שמע ----------
 
 class TranscribeRequest(BaseModel):
@@ -306,7 +323,7 @@ async def transcribe(req: TranscribeRequest):
                             fh.write(chunk)
             mime = content_type if content_type.startswith(("audio/", "video/")) else None
             notebook_id = await target_notebook(c, req.notebookId, req.notebookTitle)
-            source = await c.sources.add_file(notebook_id, path, mime, wait=True, wait_timeout=SOURCE_WAIT_SECONDS, title=req.title)
+            source = await _dropping_failed(c, notebook_id, c.sources.add_file(notebook_id, path, mime, wait=True, wait_timeout=SOURCE_WAIT_SECONDS, title=req.title))
             return await _fulltext(c, notebook_id, source.id)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -338,13 +355,14 @@ async def add_source(req: SourceRequest):
     async def run(job_id: str) -> dict:
         notebook_id = await target_notebook(c, req.notebookId, req.notebookTitle)
         if req.text:
-            source = await c.sources.add_text(notebook_id, (req.title or "טקסט")[:200], req.text, wait=True, wait_timeout=SOURCE_WAIT_SECONDS)
+            adding = c.sources.add_text(notebook_id, (req.title or "טקסט")[:200], req.text, wait=True, wait_timeout=SOURCE_WAIT_SECONDS)
         elif (m := DRIVE_RE.match(req.url or "")):
             # Google Drive: מסמכים, מצגות, PDF וקבצי שמע מהדרייב של החשבון המחובר
-            source = await c.sources.add_drive_file(notebook_id, m.group(1), title=req.title, wait=True, wait_timeout=SOURCE_WAIT_SECONDS)
+            adding = c.sources.add_drive_file(notebook_id, m.group(1), title=req.title, wait=True, wait_timeout=SOURCE_WAIT_SECONDS)
         else:
             # אתרים, יוטיוב, קובצי PDF ושמע בכתובת ציבורית — NotebookLM מוריד בעצמו
-            source = await c.sources.add_url(notebook_id, req.url, wait=True, wait_timeout=SOURCE_WAIT_SECONDS, title=req.title)
+            adding = c.sources.add_url(notebook_id, req.url, wait=True, wait_timeout=SOURCE_WAIT_SECONDS, title=req.title)
+        source = await _dropping_failed(c, notebook_id, adding)
         return await _fulltext(c, notebook_id, source.id)
 
     return {"jobId": _new_job("source", run)}

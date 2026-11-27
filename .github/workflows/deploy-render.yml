@@ -1,0 +1,24 @@
+# Render's own auto-deploy stopped firing for this repo, so every merge to main asks Render to deploy
+# through the service's Deploy Hook. The hook URL is a secret: Render → notebooklm-bridge → Settings →
+# Deploy Hook, saved in this repo as RENDER_DEPLOY_HOOK.
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK is not set; deploy it from the Render dashboard"
+            exit 0
+          fi
+          curl -fsS -X POST "$HOOK" --retry 3 --retry-delay 10 > /dev/null
+          echo "Render deploy triggered"
