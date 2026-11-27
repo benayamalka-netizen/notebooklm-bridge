@@ -301,27 +301,99 @@ class TranscribeRequest(BaseModel):
     title: str = "lesson"
     notebookId: str | None = None
     notebookTitle: str | None = None
+    # a recording too big for one upload arrives in parts, in order: "bytes" = slices of one file
+    # (MP3) that are simply put back together; "wav" = separate WAV files merged into one
+    mediaUrls: list[str] | None = None
+    join: str | None = None
+
+
+AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "video/mp4", ".aac": "audio/aac", ".wav": "audio/wav",
+               ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac",
+               ".amr": "audio/amr", ".3gp": "audio/3gpp", ".mov": "video/quicktime"}
+
+
+def _audio_ext(content_type: str, url: str) -> str:
+    """The file's real type: from its content type, or, when storage says only "octet-stream", from its name.
+    A wrong extension (".bin") makes NotebookLM fail to process the source."""
+    if content_type.startswith(("audio/", "video/")):
+        ext = mimetypes.guess_extension(content_type) or ""
+        if ext in AUDIO_TYPES:
+            return ext
+    name_ext = Path(httpx.URL(url).path).suffix.lower()
+    if name_ext in AUDIO_TYPES:
+        return name_ext
+    return ".mp3"
+
+
+async def _download(http: httpx.AsyncClient, url: str, dest: Path) -> str:
+    async with http.stream("GET", url) as resp:
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        with dest.open("wb") as fh:
+            async for chunk in resp.aiter_bytes(1 << 20):
+                fh.write(chunk)
+    return content_type
+
+
+def _merge_wavs(parts: list[Path], dest: Path) -> None:
+    import wave
+    with wave.open(str(parts[0]), "rb") as first:
+        params = first.getparams()
+    with wave.open(str(dest), "wb") as out:
+        out.setparams(params)
+        for p in parts:
+            with wave.open(str(p), "rb") as w:
+                if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != (params.nchannels, params.sampwidth, params.framerate):
+                    raise RuntimeError("the WAV parts don't share one format")
+                while True:
+                    frames = w.readframes(1 << 16)
+                    if not frames:
+                        break
+                    out.writeframes(frames)
 
 
 @app.post("/transcribe", dependencies=[Depends(require_token)])
 async def transcribe(req: TranscribeRequest):
-    if not any(req.mediaUrl.startswith(p) for p in ALLOWED_PREFIXES):
-        raise HTTPException(status_code=400, detail="mediaUrl is not under the allowed origin")
+    urls = [u for u in (req.mediaUrls or []) if u] or [req.mediaUrl]
+    if len(urls) > 30:
+        raise HTTPException(status_code=400, detail="too many parts")
+    if req.join not in (None, "bytes", "wav"):
+        raise HTTPException(status_code=400, detail="join must be bytes or wav")
+    for u in urls:
+        if not any(u.startswith(p) for p in ALLOWED_PREFIXES):
+            raise HTTPException(status_code=400, detail="mediaUrl is not under the allowed origin")
     c = client()
 
     async def run(job_id: str) -> dict:
         workdir = Path(tempfile.mkdtemp(prefix="nlm-"))
         try:
             async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(60.0, read=600.0)) as http:
-                async with http.stream("GET", req.mediaUrl) as resp:
-                    resp.raise_for_status()
-                    content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-                    ext = mimetypes.guess_extension(content_type) or ".mp3"
-                    path = workdir / f"lesson{ext}"
-                    with path.open("wb") as fh:
-                        async for chunk in resp.aiter_bytes(1 << 20):
-                            fh.write(chunk)
-            mime = content_type if content_type.startswith(("audio/", "video/")) else None
+                if len(urls) == 1:
+                    raw = workdir / "part-0"
+                    content_type = await _download(http, urls[0], raw)
+                    ext = _audio_ext(content_type, urls[0])
+                    path = raw.rename(workdir / f"lesson{ext}")
+                else:
+                    parts = []
+                    for i, u in enumerate(urls):
+                        p = workdir / f"part-{i}"
+                        content_type = await _download(http, u, p)
+                        parts.append(p)
+                    if req.join == "wav":
+                        ext = ".wav"
+                        path = workdir / "lesson.wav"
+                        _merge_wavs(parts, path)
+                    else:
+                        # slices of one file: written back to back they are the original file again
+                        ext = _audio_ext(content_type, urls[0])
+                        path = workdir / f"lesson{ext}"
+                        with path.open("wb") as out:
+                            for p in parts:
+                                with p.open("rb") as fh:
+                                    shutil.copyfileobj(fh, out, 1 << 20)
+                    for p in parts:
+                        p.unlink(missing_ok=True)
+            mime = AUDIO_TYPES.get(ext)
             notebook_id = await target_notebook(c, req.notebookId, req.notebookTitle)
             source = await _dropping_failed(c, notebook_id, c.sources.add_file(notebook_id, path, mime, wait=True, wait_timeout=SOURCE_WAIT_SECONDS, title=req.title))
             return await _fulltext(c, notebook_id, source.id)
