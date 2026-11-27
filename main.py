@@ -404,7 +404,14 @@ class ChatRequest(BaseModel):
 async def chat(req: ChatRequest):
     c = client()
     r = await c.chat.ask(req.notebookId, req.question, source_ids=req.sourceIds or None, conversation_id=req.conversationId)
-    return {"answer": r.answer, "conversationId": r.conversation_id}
+    # which source each citation [n] in the answer points to, so a site can name the lesson it came from
+    refs = []
+    for ref in getattr(r, "references", None) or []:
+        sid = getattr(ref, "source_id", None)
+        if sid:
+            refs.append({"sourceId": sid, "citation": getattr(ref, "citation_number", None),
+                         "text": (getattr(ref, "cited_text", "") or "")[:500]})
+    return {"answer": r.answer, "conversationId": r.conversation_id, "references": refs}
 
 
 # ---------- סטודיו ----------
